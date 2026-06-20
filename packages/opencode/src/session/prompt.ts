@@ -1,3 +1,29 @@
+// ============================================================
+// prompt.ts — 会话提示词与主 Agent 循环（SessionPrompt）
+//
+// 【整体职责】
+//   这是整个 Agent 系统最核心的文件，负责：
+//   1. 接收用户输入（prompt），创建用户消息
+//   2. 运行主对话循环（loop），不断调用 LLM → 执行工具 → 重复
+//   3. 处理所有特殊情况：子 Agent 调度、上下文压缩、计划模式、结构化输出
+//   4. 提供 shell 命令执行、/command 命令解析等辅助功能
+//
+// 【主循环流程（loop 函数）】
+//   while(true):
+//     1. 读取最新消息历史
+//     2. 检查退出条件（LLM 已完成、用户取消等）
+//     3. 处理待执行的 subtask（子 Agent 任务）
+//     4. 处理待执行的 compaction（上下文压缩）
+//     5. 检查上下文是否溢出
+//     6. 构建工具 map，调用 SessionProcessor.process()
+//     7. 根据返回值决定 continue / stop / compact
+//
+// 【与其他模块的关系】
+//   prompt.ts → LLM.stream()        (llm.ts)
+//   prompt.ts → SessionProcessor     (processor.ts)
+//   prompt.ts → ToolRegistry.tools() (registry.ts)
+//   prompt.ts → Agent.get()          (agent.ts)
+// ============================================================
 import path from "path"
 import os from "os"
 import fs from "fs/promises"
@@ -62,6 +88,15 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
 
+  // ──────────────────────────────────────────────────────────
+  // state — 追踪当前所有正在运行的 session
+  //
+  // 每个 session 包含：
+  // - abort: AbortController，用户取消时调用 .abort()
+  // - callbacks: 等待本次回复完成的 Promise 回调队列
+  //   （当一个 session 正在运行时，新请求会排队等待，
+  //    而不是直接抛出 BusyError）
+  // ──────────────────────────────────────────────────────────
   const state = Instance.state(
     () => {
       const data: Record<
@@ -155,6 +190,12 @@ export namespace SessionPrompt {
   })
   export type PromptInput = z.infer<typeof PromptInput>
 
+  // ──────────────────────────────────────────────────────────
+  // prompt — 对外暴露的主入口函数
+  //
+  // 接收用户输入，创建用户消息后进入 loop。
+  // 如果 noReply=true，仅保存消息不触发 LLM 调用。
+  // ──────────────────────────────────────────────────────────
   export const prompt = fn(PromptInput, async (input) => {
     const session = await Session.get(input.sessionID)
     await SessionRevert.cleanup(session)
@@ -184,6 +225,15 @@ export namespace SessionPrompt {
     return loop({ sessionID: input.sessionID })
   })
 
+  // ──────────────────────────────────────────────────────────
+  // resolvePromptParts — 解析提示词模板中的 @引用
+  //
+  // 支持：
+  // - @path/to/file  → 读取文件，作为附件
+  // - @~/file        → 读取 home 目录下的文件
+  // - @agentName     → 如果是 Agent 名称，创建 AgentPart
+  //   （这样 LLM 会知道要调用哪个子 Agent）
+  // ──────────────────────────────────────────────────────────
   export async function resolvePromptParts(template: string): Promise<PromptInput["parts"]> {
     const parts: PromptInput["parts"] = [
       {
@@ -267,6 +317,32 @@ export namespace SessionPrompt {
     return
   }
 
+  // ══════════════════════════════════════════════════════════
+  // loop — 主 Agent 对话循环 ★★★ 最核心函数 ★★★
+  //
+  // 【整体逻辑】
+  //   这是一个 while(true) 循环，每次迭代代表一轮 LLM 调用。
+  //   循环在以下情况退出：
+  //   - LLM 返回了最终回复（finish 不是 "tool-calls"/"unknown"）
+  //   - 用户取消（abort）
+  //   - 权限被拒绝（blocked）
+  //   - 发生不可重试的错误
+  //
+  // 【每次迭代的步骤】
+  //   1. 读取完整消息历史（filterCompacted 过滤已压缩的旧消息）
+  //   2. 找到最近的 user/assistant 消息，判断是否应该退出
+  //   3. 检查是否有待处理的 subtask（子 Agent 任务）
+  //      → 如有，直接执行 TaskTool，不经过 LLM
+  //   4. 检查是否有待处理的 compaction（上下文压缩）
+  //      → 如有，执行压缩后继续
+  //   5. 检查上下文是否溢出 → 创建 compaction 任务
+  //   6. 构建本轮 LLM 调用参数（工具、系统提示词、消息历史）
+  //   7. 创建 SessionProcessor，调用 processor.process()
+  //   8. 根据 process() 返回值决定下一步：
+  //      - "continue" → 继续下一轮
+  //      - "stop"     → 退出循环
+  //      - "compact"  → 创建压缩任务后继续
+  // ══════════════════════════════════════════════════════════
   export const LoopInput = z.object({
     sessionID: Identifier.schema("session"),
     resume_existing: z.boolean().optional(),
@@ -294,12 +370,18 @@ export namespace SessionPrompt {
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
       log.info("loop", { step, sessionID })
-      if (abort.aborted) break
+      if (abort.aborted) break  // 用户已取消 → 退出
+
+      // ── 步骤1：读取消息历史 ────────────────────────────────
+      // filterCompacted 会跳过已被压缩替换的旧消息
       let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
 
+      // ── 步骤2：从历史消息中提取关键信息 ──────────────────────
+      // 倒序扫描消息，找到最近的 user/assistant 消息
+      // 同时收集尚未处理的 subtask 和 compaction 任务
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
-      let lastFinished: MessageV2.Assistant | undefined
+      let lastFinished: MessageV2.Assistant | undefined  // 最近一条已完成的 assistant 消息
       let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
       for (let i = msgs.length - 1; i >= 0; i--) {
         const msg = msgs[i]
@@ -315,6 +397,10 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+      // ── 步骤3：检查退出条件 ────────────────────────────────
+      // 如果最新的 assistant 消息已完成（finish 不是 tool-calls/unknown），
+      // 且它比最近的 user 消息更新 → 说明 LLM 已给出最终回复，退出循环
       if (
         lastAssistant?.finish &&
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
@@ -347,8 +433,10 @@ export namespace SessionPrompt {
       })
       const task = tasks.pop()
 
-      // pending subtask
-      // TODO: centralize "invoke tool" logic
+      // ── 步骤4a：处理待执行的子 Agent 任务（subtask）──────────
+      // subtask 是上一轮 LLM 通过 TaskTool 派发的子任务。
+      // 这里直接执行 TaskTool，不需要再调用 LLM。
+      // TODO: 将"调用工具"逻辑统一抽象
       if (task?.type === "subtask") {
         const taskTool = await TaskTool.init()
         const taskModel = task.model ? await Provider.getModel(task.model.providerID, task.model.modelID) : model
@@ -525,7 +613,9 @@ export namespace SessionPrompt {
         continue
       }
 
-      // pending compaction
+      // ── 步骤4b：处理待执行的上下文压缩任务 ──────────────────
+      // compaction 是之前轮检测到 token 超限时创建的任务。
+      // 执行后将旧消息替换为摘要，释放 token 空间。
       if (task?.type === "compaction") {
         const result = await SessionCompaction.process({
           messages: msgs,
@@ -538,7 +628,9 @@ export namespace SessionPrompt {
         continue
       }
 
-      // context overflow, needs compaction
+      // ── 步骤5：检查上下文是否即将溢出 ────────────────────────
+      // 如果上一条 assistant 消息已用 token 超过模型限制，
+      // 创建一个 compaction 任务（下一轮循环会执行它）
       if (
         lastFinished &&
         lastFinished.summary !== true &&
@@ -553,16 +645,19 @@ export namespace SessionPrompt {
         continue
       }
 
-      // normal processing
+      // ── 步骤6：正常 LLM 调用流程 ──────────────────────────────
+      // 走到这里说明没有待处理的 subtask/compaction，可以正常调用 LLM
       const agent = await Agent.get(lastUser.agent)
       const maxSteps = agent.steps ?? Infinity
-      const isLastStep = step >= maxSteps
+      const isLastStep = step >= maxSteps  // 是否已达到最大步数
+      // 根据当前模式（plan/build）向消息注入提示词提醒
       msgs = await insertReminders({
         messages: msgs,
         agent,
         session,
       })
 
+      // 创建本轮的 SessionProcessor（负责消费 LLM 流并持久化结果）
       const processor = SessionProcessor.create({
         assistantMessage: (await Session.updateMessage({
           id: Identifier.ascending("message"),
@@ -595,10 +690,12 @@ export namespace SessionPrompt {
       })
       using _ = defer(() => InstructionPrompt.clear(processor.message.id))
 
-      // Check if user explicitly invoked an agent via @ in this turn
+      // 检查用户是否在消息中用 @agentName 直接指定了子 Agent
+      // 如果是，跳过 agent 权限检查（用户明确要求）
       const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
       const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
 
+      // 构建工具 map（内置工具 + MCP 工具 + 自定义工具，已过滤权限）
       const tools = await resolveTools({
         agent,
         session,
@@ -609,7 +706,8 @@ export namespace SessionPrompt {
         messages: msgs,
       })
 
-      // Inject StructuredOutput tool if JSON schema mode enabled
+      // 如果用户请求了结构化 JSON 输出，注入特殊工具 StructuredOutput
+      // LLM 必须调用此工具来返回符合 schema 的 JSON 对象
       if (lastUser.format?.type === "json_schema") {
         tools["StructuredOutput"] = createStructuredOutputTool({
           schema: lastUser.format.schema,
@@ -626,7 +724,8 @@ export namespace SessionPrompt {
         })
       }
 
-      // Ephemerally wrap queued user messages with a reminder to stay on track
+      // 如果用户在 LLM 还在运行时发送了新消息（排队等待），
+      // 在消息周围包裹 <system-reminder>，提醒 LLM 处理完当前任务后响应新消息
       if (step > 1 && lastFinished) {
         for (const msg of msgs) {
           if (msg.info.role !== "user" || msg.info.id <= lastFinished.id) continue
@@ -647,13 +746,19 @@ export namespace SessionPrompt {
 
       await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-      // Build system prompt, adding structured output instruction if needed
+      // 组装系统提示词：环境信息（操作系统、日期、项目路径等）+ 指令提示词
       const system = [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())]
       const format = lastUser.format ?? { type: "text" }
       if (format.type === "json_schema") {
         system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
       }
 
+      // ── 步骤7：执行 LLM 调用，等待本轮结果 ──────────────────
+      // processor.process() 会：
+      //   a. 调用 LLM.stream() 获取流
+      //   b. 遍历流中的每个事件（text、tool-call、tool-result 等）
+      //   c. 持久化每个 Part 到数据库
+      //   d. 返回 "continue"/"stop"/"compact"
       const result = await processor.process({
         user: lastUser,
         agent,
@@ -676,8 +781,8 @@ export namespace SessionPrompt {
         toolChoice: format.type === "json_schema" ? "required" : undefined,
       })
 
-      // If structured output was captured, save it and exit immediately
-      // This takes priority because the StructuredOutput tool was called successfully
+      // ── 步骤8：处理结构化输出（如果有）──────────────────────
+      // 如果 LLM 调用了 StructuredOutput 工具，保存结果并退出
       if (structuredOutput !== undefined) {
         processor.message.structured = structuredOutput
         processor.message.finish = processor.message.finish ?? "stop"
@@ -700,8 +805,9 @@ export namespace SessionPrompt {
         }
       }
 
-      if (result === "stop") break
-      if (result === "compact") {
+      // ── 步骤9：根据 process() 返回值决定下一步 ───────────────
+      if (result === "stop") break  // 权限拒绝或错误 → 退出循环
+      if (result === "compact") {   // token 超限 → 创建压缩任务，下轮处理
         await SessionCompaction.create({
           sessionID,
           agent: lastUser.agent,
@@ -711,7 +817,10 @@ export namespace SessionPrompt {
       }
       continue
     }
+    // ── 循环结束后的清理 ──────────────────────────────────────
+    // 删除无效的 compaction 任务（可能因为提前退出而遗留的）
     SessionCompaction.prune({ sessionID })
+    // 找到最终的 assistant 消息，通知所有等待中的 Promise 回调
     for await (const item of MessageV2.stream(sessionID)) {
       if (item.info.role === "user") continue
       const queued = state()[sessionID]?.callbacks ?? []
@@ -730,6 +839,15 @@ export namespace SessionPrompt {
     return Provider.defaultModel()
   }
 
+  // ──────────────────────────────────────────────────────────
+  // resolveTools — 构建本轮 LLM 调用的工具 map
+  //
+  // 流程：
+  // 1. 从 ToolRegistry 获取所有内置工具（按 model/agent 过滤）
+  // 2. 将每个工具包装进 AI SDK tool()，添加权限检查和插件钩子
+  // 3. 追加 MCP 工具（来自 MCP 服务器的外部工具）
+  // 返回的 map 直接传给 LLM.stream() 的 tools 参数
+  // ──────────────────────────────────────────────────────────
   /** @internal Exported for testing */
   export async function resolveTools(input: {
     agent: Agent.Info
@@ -825,6 +943,10 @@ export namespace SessionPrompt {
       })
     }
 
+    // ── 追加 MCP 工具（来自外部 MCP 服务器）────────────────────
+    // MCP（Model Context Protocol）工具由外部进程提供，
+    // 这里包装 execute 函数添加权限检查和插件钩子，
+    // 并处理工具结果中的文本/图片/资源等多种类型
     for (const [key, item] of Object.entries(await MCP.tools())) {
       const execute = item.execute
       if (!execute) continue
@@ -951,6 +1073,16 @@ export namespace SessionPrompt {
     })
   }
 
+  // ──────────────────────────────────────────────────────────
+  // createUserMessage — 创建并持久化用户消息
+  //
+  // 负责：
+  // 1. 确定本次使用的 agent 和 model
+  // 2. 处理消息中的每个 Part（文件、图片、MCP资源、agent引用等）
+  // 3. 将 file:// URL 指向的文件内容读入（变成 data: URL 或文本）
+  // 4. 触发 chat.message 插件钩子
+  // 5. 保存消息和所有 Part 到数据库
+  // ──────────────────────────────────────────────────────────
   async function createUserMessage(input: PromptInput) {
     const agent = await Agent.get(input.agent ?? (await Agent.defaultAgent()))
 
@@ -1318,6 +1450,14 @@ export namespace SessionPrompt {
     }
   }
 
+  // ──────────────────────────────────────────────────────────
+  // insertReminders — 根据当前模式注入提示词提醒
+  //
+  // 处理 plan 模式 ↔ build 模式 的切换提示：
+  // - 进入 plan 模式：注入详细的 Plan 工作流提示词（5个阶段）
+  // - 退出 plan 模式（切换到 build）：读取 plan 文件，提示 LLM 执行计划
+  // - 普通 build 模式中，如果之前有 plan 消息：注入 BUILD_SWITCH 提示词
+  // ──────────────────────────────────────────────────────────
   async function insertReminders(input: { messages: MessageV2.WithParts[]; agent: Agent.Info; session: Session.Info }) {
     const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
     if (!userMessage) return input.messages
@@ -1470,6 +1610,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     command: z.string(),
   })
   export type ShellInput = z.infer<typeof ShellInput>
+  // ──────────────────────────────────────────────────────────
+  // shell — 用户直接执行 shell 命令（不经过 LLM）
+  //
+  // 主要用于 TUI 中用户直接运行命令（如 !ls）。
+  // 会创建一条用户消息和一条 assistant 消息（包含 tool=bash 的 Part），
+  // 然后执行实际命令，将输出流式更新到 UI。
+  // 命令完成后，如果有排队的 LLM 请求，会自动恢复 loop。
+  // ──────────────────────────────────────────────────────────
   export async function shell(input: ShellInput) {
     const abort = start(input.sessionID)
     if (!abort) {
@@ -1741,6 +1889,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
    * Does not match when preceded by word characters or backticks (to avoid email addresses and quoted references)
    */
 
+  // ──────────────────────────────────────────────────────────
+  // command — 执行 /command 斜杠命令
+  //
+  // 用户在对话中输入 /commit、/review 等命令时调用。
+  // 流程：
+  // 1. 加载命令模板（含 $1/$2/$ARGUMENTS 占位符）
+  // 2. 将用户参数填入模板
+  // 3. 执行模板中的 !`shell命令`（如果有）
+  // 4. 判断是否需要派发为 subtask（子 Agent）
+  // 5. 最终调用 prompt() 进入主循环
+  // ──────────────────────────────────────────────────────────
   export async function command(input: CommandInput) {
     log.info("command", input)
     const command = await Command.get(input.command)
@@ -1885,6 +2044,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     return result
   }
 
+  // ──────────────────────────────────────────────────────────
+  // ensureTitle — 为新会话自动生成标题
+  //
+  // 在第一轮对话时异步触发，使用 "title" Agent（小模型）
+  // 根据第一条用户消息生成一个简短标题（最多100字符）。
+  // 不会阻塞主流程（fire-and-forget 模式）。
+  // ──────────────────────────────────────────────────────────
   async function ensureTitle(input: {
     session: Session.Info
     history: MessageV2.WithParts[]

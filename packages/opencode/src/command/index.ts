@@ -27,6 +27,10 @@ export const Info = Schema.Struct({
   source: Schema.optional(Schema.Literals(["command", "mcp", "skill"])),
   // Some command templates are lazy promises from MCP prompt resolution.
   template: Schema.Unknown,
+  // 【任务管理补充】true 时强制这个命令走 subtask 队列（不管绑定的 agent
+  // 是不是 subagent 模式），false 时强制禁用；不设置则由 prompt.ts 的
+  // command() 按 agent.mode==="subagent" 自动判断。触发逻辑见 prompt.ts
+  // 里 isSubtask 那行的注释。
   subtask: Schema.optional(Schema.Boolean),
   hints: Schema.Array(Schema.String),
 }).annotate({ identifier: "Command" })
@@ -83,6 +87,9 @@ const layer = Layer.effect(
         get template() {
           return PROMPT_REVIEW.replace("${path}", ctx.worktree)
         },
+        // 【任务管理补充】真实例子：内置 /review 命令硬编码 subtask:true，
+        // 让"审查"跑在独立子任务上下文里，不把一堆 diff/文件读取塞进
+        // 当前对话的上下文——跑完只把审查结论带回来
         subtask: true,
         hints: hints(PROMPT_REVIEW),
       }

@@ -65,6 +65,12 @@ export const SessionTable = sqliteTable(
   ],
 )
 
+// 【任务管理补充：message/part 表的真实存储形态】
+// role（user/assistant）、finish（tool-calls/stop）这些字段并不是这张表的
+// SQL 列，全部塞在下面 data 这一个 JSON TEXT 列里。数据库本身只知道
+// "这行属于哪个 session、id 是多少"，具体这条消息是不是 user、有没有
+// finish，要等应用层用 Effect Schema 解码 data 之后才知道
+// （对应 message-v2.ts 里的 info()/part() 两个转换函数）。
 export const MessageTable = sqliteTable(
   "message",
   {
@@ -79,6 +85,9 @@ export const MessageTable = sqliteTable(
   (table) => [index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id)],
 )
 
+// 同理，type（compaction/subtask/tool/text/...）也在 data 这个 JSON 列里，
+// 不是 SQL 列。message-v2.ts 的 latest()/tasks 就是把这张表全量查出来、
+// 解出 data 之后在内存里用普通数组方法筛选，不是数据库层面的 SQL 过滤
 export const PartTable = sqliteTable(
   "part",
   {

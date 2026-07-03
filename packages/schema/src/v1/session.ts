@@ -66,6 +66,12 @@ export class OutputFormatText extends Schema.Class<OutputFormatText>("OutputForm
   type: Schema.Literal("text"),
 }) {}
 
+// 【结构化输出补充】schema 字段是调用 session.prompt(...) 的调用方自己传进来的
+// JSON Schema（不是模型生成的），描述了想要的 key/类型；session/prompt.ts 里
+// 把它包成一个叫 StructuredOutput 的工具塞给模型。retryCount 默认值是 2，
+// 看名字像是"结构化输出失败后自动重试几次"，但目前全仓库没有任何代码读取
+// 这个字段——是设计了但还没接上的半成品，session/prompt.ts 里失败时是直接
+// 报 StructuredOutputError，没有真正的自动重试。
 export class OutputFormatJsonSchema extends Schema.Class<OutputFormatJsonSchema>("OutputFormatJsonSchema")({
   type: Schema.Literal("json_schema"),
   schema: Schema.Record(Schema.String, Schema.Any).annotate({ identifier: "JSONSchema" }),

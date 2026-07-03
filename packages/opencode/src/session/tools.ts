@@ -36,6 +36,14 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/webp",
 ])
 
+// 【学习顺序：七】七.一 —— 工具解析总览：把 ToolRegistry 里的工具"翻译"成 AI SDK 认识的格式
+// 每一轮循环都会重新调用一次（见 prompt.ts runLoop 的六.四）。核心工作：
+//   1. 从 ToolRegistry 拿到这个 Agent/Model 组合下可用的工具定义列表（七.二）
+//   2. 用 AI SDK 的 tool() 包一层，真正的 execute 桥接到 Effect 世界执行（七.三）
+//   3. 权限检查(ask)/进度上报(metadata)都通过 Tool.Context 注入给工具实现
+// 也就是说，"工具"这个概念在两层世界里长得不一样：ToolRegistry 里是
+// Effect-based 的纯函数式实现，AI SDK 层面看到的是普通 async execute()。
+// 这个函数就是两者之间的适配层。
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
@@ -86,6 +94,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         .pipe(Effect.orDie),
   })
 
+  // 七.二 —— registry.tools(...) 按当前 model/provider/agent 过滤出这次能用的工具集
+  // （不同模型对工具数量/schema 复杂度有限制，不同 Agent 有不同工具白名单）
+  // 这里的 registry 就是 ToolRegistry.Service，工具的来源汇总见【学习顺序：八】
   for (const item of yield* registry.tools({
     modelID: ModelV2.ID.make(input.model.api.id),
     providerID: input.model.providerID,
@@ -95,6 +106,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     tools[item.id] = tool({
       description: item.description,
       inputSchema: jsonSchema(schema),
+      // 七.三 —— AI SDK 要求 execute 是返回 Promise 的普通函数，但工具的真正实现
+      // (item.execute) 是 Effect。run.promise(...) 就是 EffectBridge 提供的
+      // "把一段 Effect 当 Promise 跑起来"的桥接方法——这是整个工程里
+      // Effect 生态和外部 JS 生态（这里是 AI SDK）打交道的典型模式。
+      // 下一步：工具从哪来 —— 看【学习顺序：八】(packages/opencode/src/tool/registry.ts)
       execute(args, options) {
         return run.promise(
           Effect.gen(function* () {
@@ -104,7 +120,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
               { args },
             )
-            const result = yield* item.execute(args, ctx)
+            const result = yield* item.execute(args, ctx) // 真正的工具逻辑（读文件/写文件/跑命令...）
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({

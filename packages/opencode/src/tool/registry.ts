@@ -106,6 +106,13 @@ const layer = Layer.effect(
     const skilltool = yield* SkillTool
     const agent = yield* Agent.Service
 
+    // 【学习顺序：八】八.一 —— 工具注册表：统一收拢三类工具来源
+    // 1) builtin：内置工具（read/write/edit/grep/glob/shell/task/...），代码里直接 import
+    // 2) custom：项目目录下 tool/*.ts、tools/*.ts 里用户自定义的工具文件（动态 import）
+    // 3) plugin：插件系统注册的工具（p.tool）
+    // （注：MCP server 提供的工具不在这张表里统一管理，是在 session/tools.ts
+    // 里单独通过 MCP.Service 合并进最终工具集的，属于另一条来源）
+    // InstanceState.make 表示这份状态是"每个工作目录一份"、懒加载并缓存的
     const state = yield* InstanceState.make<State>(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
         const custom: Tool.Def[] = []
@@ -263,6 +270,11 @@ const layer = Layer.effect(
       return ["Available agent types and the tools they have access to:", description].join("\n")
     })
 
+    // 八.二 —— 每次调模型前实际拿到的工具集：在全量工具基础上按 model/provider 再过滤一层。
+    // 典型例子：部分 GPT 模型更适配 apply_patch 风格而不是 edit/write 风格，
+    // 这里按 modelID 字符串特征做二选一，而不是把两套工具都暴露给模型增加干扰。
+    // 这就是 tools.ts 七.二里调的 registry.tools(...)。
+    // 下一步：回到【学习顺序：九】(session/prompt.ts 里 handle.process() 调用处)
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const filtered = (yield* all()).filter((tool) => {
         if (tool.id === WebSearchTool.id) {

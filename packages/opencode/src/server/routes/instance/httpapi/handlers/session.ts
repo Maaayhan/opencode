@@ -292,6 +292,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    // ============================================================
+    // 【学习顺序：一】请求入口 一.一 —— 同步 prompt
+    // 整条 Agent 链路真正的"第一站"：TUI/App 通过 SDK 调 POST .../prompt，
+    // 请求打到这里。yield* promptSvc.prompt(...) 直接调的就是
+    // session/prompt.ts 里的 SessionPrompt.prompt，会一路阻塞到
+    // runLoop 整个跑完（模型问完、工具都执行完）才返回最终消息。
+    // 适合"一次性问答"式调用（比如 SDK/脚本调用），但不适合交互式 UI——
+    // 界面早就想边跑边看流式内容了，不会傻等一次性返回。
+    // 下一步：去看 一.二（本文件下方 promptAsync）
+    // ============================================================
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
@@ -308,6 +318,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       })
     })
 
+    // 【学习顺序：一】请求入口 一.二 —— 异步 promptAsync（TUI/App 实际用的是这条）
+    // 关键区别：Effect.forkIn(scope, { startImmediately: true }) 把整个
+    // runLoop 扔到后台 fiber 里跑，HTTP 请求立刻返回 204 NoContent。
+    // 界面拿到"已受理"的确认后，通过另一条 SSE 长连接
+    // (event.subscribe，见下方/别处 EventV2Bridge 用法) 去订阅这个 session
+    // 后续产生的所有事件，实时渲染。这就是"提交"和"执行结果展示"
+    // 被拆成两条独立通道的原因——避免一个长轮询 HTTP 请求把连接占死。
+    // 循环内部出的任何未捕获错误在这里兜底捕获，转成一条 Error 事件发布出去，
+    // 而不是让整个后台 fiber 静默死掉、前端却毫无感知。
+    // 下一步：这里调用的 promptSvc.prompt(...) 是入口的终点，
+    // 真正的主循环在 packages/opencode/src/session/prompt.ts —— 去看【学习顺序：二】
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type

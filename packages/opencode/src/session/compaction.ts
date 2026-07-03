@@ -510,6 +510,15 @@ const layer = Layer.effect(
       return result
     })
 
+    // 【任务管理补充：compaction 任务是怎么"挂"上去的】
+    // 这里没有任何真人输入，纯粹是系统代码自己造了一条 role:"user" 的消息
+    // （只是为了有个地方挂 compaction part，本身没有文本内容）。调用方通常是
+    // prompt.ts runLoop 的主动溢出检测（token 超阈值），或某轮 handle.process()
+    // 返回 "compact" 信号。
+    // 关键点：MessageID.ascending() 保证这条新消息的 id 比之前所有消息都大，
+    // 所以它在 message-v2.ts 的 latest() 现算 tasks 数组时，一定排在最后一位
+    // ——配合 prompt.ts 里 tasks.pop() 取末位的逻辑，压缩任务永远能插队到
+    // 比它更早排队的 subtask 前面被优先处理，不需要单独的优先级字段。
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
       sessionID: SessionID
       agent: string

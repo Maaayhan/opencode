@@ -582,6 +582,25 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 // assistant doesn't get mistaken for the most recent turn. tasks are
 // compaction/subtask parts attached to user messages newer than the latest
 // finished assistant — i.e. unprocessed work.
+// 【任务管理补充：latest() 是任务队列的"现算"入口】
+// msgs 是这个 session 的全量消息历史（user + assistant 都在内，来自上面
+// stream() 分页查出来的完整列表，不是只留最后一条）。prompt.ts 的 runLoop
+// 每一轮循环开头都会重新调一次本函数——没有任何内存状态跨轮传递，
+// 纯粹是"数据库现在长什么样就现算什么样"。
+//
+// finished 就是一根"边界指针"：最新一条已经带 finish 值的 assistant 消息。
+// 不要求 finish==="stop"，只要有 finish 值就算数（哪怕是 "tool-calls"，
+// 也代表这个 assistant 回合已经走完一次收尾流程了）。
+//
+// tasks 只统计 id > finished.id 的消息里、类型是 compaction/subtask 的 part
+// ——这两种是系统级"绕开模型直接处理"的任务标记，跟模型自己发起的
+// 普通工具调用（type: "tool"，挂在 assistant 消息上）是两套不同机制，
+// 后者在同一次 LLM 流式请求里就同步执行完了，不需要这套跨轮扫描。
+//
+// msgs 里消息顺序 = MessageID.ascending() 保证的创建顺序，所以 tasks 数组
+// 天然是"越晚创建的排越后"。prompt.ts 里 tasks.pop() 取的是数组最后一个，
+// 也就是最晚创建的任务——这让"临时插入的压缩任务"能自动排到最前面被处理，
+// 不需要额外的优先级字段（细节见 compaction.ts 的 create()）。
 export function latest(msgs: WithParts[]) {
   let user: User | undefined
   let assistant: Assistant | undefined

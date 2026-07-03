@@ -273,6 +273,13 @@ const layer = Layer.effect(
         }
       }
 
+      // 【学习顺序：十二】十二.一 —— 流式事件消费入口
+      // llm.stream()（十一）吐出的是 provider 无关的统一事件流（reasoning-*/text-*/
+      // tool-input-*/tool-call/tool-result/finish...），这里按事件类型 switch，
+      // 核心模式是：每来一个事件就立刻 updatePart / updatePartDelta 写库一次，
+      // 而不是等模型说完一整段再落库。这正是"边生成边展示"打字机效果的来源，
+      // 同时也保证了进程崩溃/中断时已经收到的内容不会丢。
+      // （虽然定义在文件靠前的位置，但实际是被十.三的 Stream.tap 调用的）
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
         switch (value.type) {
           case "reasoning-start":
@@ -366,6 +373,11 @@ const layer = Layer.effect(
               return
             }
 
+            // 十二.二 —— "死循环"检测（doom_loop）
+            // 工程上的一个防御设计：如果最近连续 DOOM_LOOP_THRESHOLD(=3) 次
+            // 工具调用都是同一个工具、同样的入参，说明模型大概率卡在死循环里
+            // 空转（比如反复读同一个文件却没有进展）。这种情况不会自动 kill
+            // 会话，而是转成一次权限询问，交给用户判断是否要继续放行。
             const agent = yield* agents.get(ctx.assistantMessage.agent)
             yield* permission.ask({
               permission: "doom_loop",
@@ -378,6 +390,12 @@ const layer = Layer.effect(
             return
           }
 
+          // 十二.三 —— 工具的真正执行（读写文件/跑命令等）不在这个文件里发生——
+          // 真正的 execute() 挂在 AI SDK 的 tool() 定义上（对应【学习顺序：七】session/tools.ts），
+          // AI SDK 在内部跑完工具后才会吐出这个 tool-result 事件，
+          // 这里只是把结果规范化（图片等附件处理）后落库、并唤醒等待方
+          // 到这里，一整轮"调模型 -> 收流 -> 执行工具 -> 结果落库"就闭环了，
+          // 回到【学习顺序：十三】(session/prompt.ts 里 result 处理那段)
           case "tool-result": {
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
@@ -622,6 +640,13 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      // 【学习顺序：十】十.一 —— process()：这一轮里唯一真正"打模型"的地方
+      // 被 prompt.ts 的 runLoop 在每轮循环里调用一次（对应【学习顺序：九】）。核心三行是：
+      //   1. const stream = llm.stream(streamInput)   —— 发起流式请求，去看【学习顺序：十一】(session/llm.ts)
+      //   2. Stream.tap(handleEvent)                  —— 每个事件都实时落库/推送，去看【学习顺序：十二】(本文件上方 handleEvent)
+      //   3. Stream.runDrain                           —— 把流耗尽，等这一轮彻底结束
+      // 外层包了三层防护：中断处理(onInterrupt)、按 provider 定制的重试策略
+      // (SessionRetry.policy，比如 429 限流退避)、以及兜底 halt() 落错误。
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
@@ -635,11 +660,11 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream(streamInput) // 十.二 —— 真正发请求，见【学习顺序：十一】session/llm.ts
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction),
+              Stream.tap((event) => handleEvent(event)), // 十.三 —— 逐事件消费、落库，见【学习顺序：十二】
+              Stream.takeUntil(() => ctx.needsCompaction), // 一旦发现要压缩就提前掐断流，不用等模型说完
               Stream.runDrain,
             )
           }).pipe(
@@ -655,6 +680,8 @@ const layer = Layer.effect(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
             ),
+            // 十.四 —— provider 相关的自动重试（限流/瞬时错误等），带指数退避，
+            // 重试期间通过 status.set 把"重试中"状态推给前端而不是假装卡住
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
@@ -674,6 +701,8 @@ const layer = Layer.effect(
             Effect.ensuring(cleanup()),
           )
 
+          // 十.五 —— 这个返回值就是 prompt.ts 里 runLoop 拿到的 result（回到【学习顺序：九】旁边的 result）：
+          // 决定下一轮是"排队压缩"还是"直接结束"还是"继续问模型"
           if (ctx.needsCompaction) return "compact"
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"

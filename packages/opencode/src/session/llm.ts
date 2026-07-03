@@ -51,6 +51,13 @@ export type StreamRequest = StreamInput & {
   abort: AbortSignal
 }
 
+// 【学习顺序：十一】十一.一 —— Provider 抽象层
+// processor.ts（十）只认识一种东西：Stream<LLMEvent>（provider 无关的统一事件流）。
+// 这个模块负责把"任意 provider 的具体请求方式"适配成这一种流，屏蔽掉
+// OpenAI/Anthropic/Gemini 等各家 API 形态的差异。内部实际有两条实现路径
+// (见下面 stream 的实现，十一.二)：默认走 Vercel AI SDK 的 streamText；
+// 灰度开关 experimentalNativeLlm 打开时走自研的 @opencode-ai/llm 原生实现。
+// 两条路径最终都被拍平成同一种 LLMEvent 流，processor.ts 完全不关心走的是哪条。
 export interface Interface {
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
@@ -354,6 +361,10 @@ const live: Layer.Layer<
       }
     })
 
+    // 十一.二 —— 对外唯一入口：processor.ts 十.二里的 `llm.stream(streamInput)` 调的就是这个。
+    // Stream.scoped + AbortController：session 中断/超时时通过 scope 释放
+    // 自动触发 abort，不需要在每个调用点手动管生命周期。
+    // 拿到这个事件流后，回到【学习顺序：十二】(processor.ts 的 handleEvent) 继续看怎么消费
     const stream: Interface["stream"] = (input) =>
       Stream.scoped(
         Stream.unwrap(

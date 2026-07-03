@@ -22,15 +22,31 @@ function eventID() {
   return EventV2.ID.create()
 }
 
+// ============================================================
+// 【学习顺序：十五（终点）】十五.一 —— 结果出口：SSE 事件流，Agent 链路的最后一环
+// prompt.ts / processor.ts 里到处出现的 `events.publish(...)`
+// （文本增量、工具状态变化、错误、finish 等）最终都汇聚到这里对外广播。
+// 前端（TUI/App）连上这一条长连接后，同一个工作目录里发生的所有事件都会
+// 实时推过来，不管是哪个 session、哪一轮循环触发的——由前端自己按 sessionID
+// 分发去更新对应的会话界面。这也是为什么 promptAsync（一.二）可以直接返回：
+// 真正的内容展示完全依赖这条独立的 SSE 通道，而不是那次 HTTP 请求的响应体。
+// 走到这里，"用户敲回车 -> 提交 -> 循环调度 -> 调模型 -> 执行工具 -> 结果推回界面"
+// 一整条链路就闭环了。
+// ============================================================
 function eventResponse(events: EventV2.Interface) {
   return Effect.gen(function* () {
     const instance = yield* InstanceState.context
     const workspaceID = yield* InstanceState.workspaceID
     // Listener registration is eager, so events published after this point cannot
     // be lost while the HTTP body fiber is starting or emitting server.connected.
+    // 十五.二 —— 先订阅、用一个无界队列把事件缓冲住，再慢慢转成 HTTP 流吐出去——
+    // 避免"连接建立"和"开始收事件"之间有个空档期导致事件丢失
     const queue = yield* Queue.unbounded<EventV2.Payload>()
     const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
     yield* Effect.addFinalizer(() => unsubscribe)
+    // 十五.三 —— EventV2Bridge 内部是全进程共享的总线（一个进程可能同时服务多个工作目录/
+    // session），这里按当前连接所属的 directory/workspace 过滤，
+    // 确保这条 SSE 连接只收到"跟自己相关"的事件
     const stream = Stream.fromQueue(queue).pipe(
       Stream.filter(
         (event) =>

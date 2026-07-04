@@ -61,6 +61,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const mcp = yield* MCP.Service
   const truncate = yield* Truncate.Service
 
+  // context() 是个工厂函数：每次某个工具真正 execute() 时都会重新调用一次，
+  // 用这次调用自己的 options.toolCallId 生成一份专属的 Tool.Context ——
+  // 下面 metadata/ask 两个闭包都捕获的是"这一次调用"的 toolCallId，
+  // 不会跟同一 session、甚至同一工具的其它调用互相影响。
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
     abort: options.abortSignal!,
@@ -69,6 +73,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
     agent: input.agent.name,
     messages: input.messages,
+    // metadata：工具执行过程中上报"进度信息"用的（比如标题、当前在干嘛），
+    // 只更新这一次 toolCallId 对应的那条 ToolPart 记录，跟权限无关。
+    // 如果这条记录已经 complete/error 了就不再覆盖（防止异步上报把状态错误地改回 running）。
     metadata: (val) =>
       input.processor.updateToolCall(options.toolCallId, (match) => {
         if (!["running", "pending"].includes(match.state.status)) return match
@@ -83,6 +90,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           },
         }
       }),
+    // ask：真正管权限的地方。工具实现里如果需要用户确认（比如 bash/task 这类敏感操作），
+    // 调 ctx.ask(...) 会走到 Permission.Service，按 agent + session 的权限规则
+    // （ruleset）判断要不要弹确认框、或者直接放行/拒绝。
     ask: (req) =>
       permission
         .ask({
@@ -115,12 +125,18 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const ctx = context(args, options)
+            // 【plugin.trigger 补充】只是"钩子总线"：遍历所有已加载插件，
+            // 谁实现了同名 hook 就调一下，本身不做功能，效果取决于插件实现。
+            // before/after 这两个点目前没有任何内置插件占用，是留给自定义插件的空位。
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
               { args },
             )
             const result = yield* item.execute(args, ctx) // 真正的工具逻辑（读文件/写文件/跑命令...）
+            // 【attachments/part 补充】这里不是新建一条独立 Part，而是把产出的文件
+            // 塞进这条 ToolPart 自己的 state.attachments 里（长得跟 FilePart 一样，
+            // 有自己的 id/sessionID/messageID，方便 UI 复用同一套渲染组件）。
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({
@@ -135,6 +151,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
               output,
             )
+            // 【abort 检查补充】options.abortSignal 是活的共享对象，不是快照值——
+            // item.execute 跑的这段时间里，外部（用户点停止）可能异步把它 abort 掉。
+            // 正常落库靠 processor.ts 的 tool-result 流事件，但流一旦被中断，
+            // 那个事件大概率不会再来，所以这里执行完顺便自己兜底写一次，
+            // 防止这条 ToolPart 永远卡在 running（僵尸记录）。
             if (options.abortSignal?.aborted) {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
@@ -144,6 +165,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       },
     })
   }
+  // 【七.三 到此结束】小结：七.三就是这个 execute()——用 run.promise 把 Effect
+  // 桥接成 AI SDK 要的 Promise，前后触发 plugin 钩子，中间调 item.execute 跑真正的
+  // 工具逻辑。看到这里，主链路（七.一→七.二→七.三）就完整了，可以直接跳去
+  // 【学习顺序：八】(tool/registry.ts) 看工具是从哪、怎么汇总出来的。
+  // 下面到 hasMcpResourceServer 为止是 MCP resource 相关的几个内置工具注册，
+  // 是主链路的旁支细节，不影响理解八，可以先跳过。
 
   const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
     (client) => !!client.getServerCapabilities()?.resources,

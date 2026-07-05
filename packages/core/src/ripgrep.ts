@@ -82,6 +82,11 @@ export interface Interface {
   readonly grep: (input: GrepInput) => Effect.Effect<readonly Match[], Error | InvalidPatternError>
 }
 
+// 【架构分层 · 第④层：底层能力层】Ripgrep.Service 不知道"工具""AI SDK""LLM"
+// 这些概念的存在——它就是对 rg（ripgrep 二进制）这个外部程序的一层薄封装
+// （下面 glob/grep 实现最终都是 spawn 子进程去跑 rg，见 run() 里的 process.spawn）。
+// 谁都能用：GlobTool 用它做文件名匹配，GrepTool 用它做内容搜索。
+// 复用的是"能力"，不是"工具"——这一层完全不关心调用方是不是在响应模型请求。
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Ripgrep") {}
 
 const failure = (message: string, cause?: unknown) => new Error({ message, cause })

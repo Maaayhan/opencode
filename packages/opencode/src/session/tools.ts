@@ -112,6 +112,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     providerID: input.model.providerID,
     agent: input.agent,
   })) {
+    // 【架构分层 · 第①层：AI SDK Tool Wrapper】这里往下到 execute() 结束，
+    // 是整条链路里唯一跟"AI SDK 要求工具长什么样"打交道的地方——只关心
+    // "怎么包一层壳给 AI SDK 用"，不关心工具内部具体干了什么业务逻辑。
+    // 下一层（②工具抽象层 Tool.define/wrap）在 tool/tool.ts。
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({
       description: item.description,

@@ -86,6 +86,12 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const agents = yield* Agent.Service
     const truncate = yield* Truncate.Service
+    // 【flag 补充】RuntimeFlags.Service（effect/runtime-flags.ts）：一批"功能开关"，
+    // 大部分是读环境变量（比如 OPENCODE_ENABLE_EXA / OPENCODE_EXPERIMENTAL_LSP_TOOL），
+    // 没设置就用默认值（通常是 false）。跟这个项目里其它 Service 一样走 DI 注入，
+    // 谁想用就 yield* 一下。作用：控制实验性功能/工具要不要暴露出来，
+    // 不用改代码结构，改环境变量就能灰度开关（比如上面 questionEnabled、
+    // flags.experimentalLspTool、flags.enableExa 这些判断）。
     const flags = yield* RuntimeFlags.Service
 
     const invalid = yield* InvalidTool
@@ -115,8 +121,14 @@ const layer = Layer.effect(
     // InstanceState.make 表示这份状态是"每个工作目录一份"、懒加载并缓存的
     const state = yield* InstanceState.make<State>(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
+        // 1. 准备 custom 工具
         const custom: Tool.Def[] = []
 
+        // 【八.一 旁支，可跳过】fromPlugin：把"插件/自定义工具"作者写的 ToolDefinition
+        // （用 Zod 描述参数）适配成内部统一的 Tool.Def（用 JSON Schema）。
+        // 只有你自己要写插件工具、或者好奇 Zod→JSON Schema 怎么转时才需要细看，
+        // 不影响理解"工具是怎么流转到 LLM 的"这条主线，可以直接跳到下面 204 行。
+        // 2. 定义一个转换器；Plugin ToolDefinition -》fromPlugin -》 Internal Tool.Def
         function fromPlugin(id: string, def: ToolDefinition): Tool.Def {
           // Plugin tools still expose Zod args publicly; keep that compatibility
           // boxed at the registry boundary and give the LLM the original JSON Schema.
@@ -126,10 +138,12 @@ const layer = Layer.effect(
           const entries = Object.entries(args)
           const allZod = entries.every((entry) => isZodType(entry[1]))
           const zodParams = allZod ? z.object(args) : undefined
+          // 2.1. 转参数 schema
           const jsonSchema = zodParams ? zodJsonSchema(zodParams) : legacyJsonSchema(entries)
           const parameters = zodParams
             ? Schema.declare<unknown>((u): u is unknown => zodParams.safeParse(u).success)
             : Schema.Unknown
+          // 2.2. 返回统一工具格式
           return {
             id,
             parameters,
@@ -146,12 +160,14 @@ const layer = Layer.effect(
                   directory: ctx.directory,
                   worktree: ctx.worktree,
                 }
+                // 调插件自己的 execute, def.execute(...), 把Promise变成Effect
                 const result = yield* Effect.promise(() => def.execute(args as any, pluginCtx))
                 const output = typeof result === "string" ? result : result.output
                 const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
                 const attachments = typeof result === "string" ? undefined : result.attachments
                 const info = yield* agent.get(toolCtx.agent)
                 const out = yield* truncate.output(output, {}, info)
+                // 整理输出
                 return {
                   title: typeof result === "string" ? "" : (result.title ?? ""),
                   output: out.truncated ? out.content : output,
@@ -175,6 +191,10 @@ const layer = Layer.effect(
           }
         }
 
+        // 【八.一 旁支，可跳过】custom 来源汇总：扫描项目目录下 tool/*.ts、tools/*.ts
+        // 动态 import，再加上所有插件里 p.tool 挂出来的工具，统一走 fromPlugin() 适配。
+        // 这部分只是"custom 工具从哪来"的细节，主线不需要逐行看。
+        // 3. 找项目里的自定义工具
         const dirs = yield* config.directories()
         const matches = dirs.flatMap((dir) =>
           Glob.scanSync("{tool,tools}/*.{js,ts}", { cwd: dir, absolute: true, dot: true, symlink: true }),
@@ -191,6 +211,7 @@ const layer = Layer.effect(
           }
         }
 
+        // 4. 找插件提供的工具
         const plugins = yield* plugin.list()
         for (const p of plugins) {
           for (const [id, def] of Object.entries(p.tool ?? {})) {
@@ -199,8 +220,13 @@ const layer = Layer.effect(
         }
 
         yield* config.get()
+        // 【八.一 主线，从这开始要看】questionEnabled 是个典型的"功能开关"写法：
+        // 新工具/新客户端能力上线前先用 flag 挡住，而不是直接全量放开。
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
 
+        // Tool.init(...) 这一串就是"内置工具"的真正清单——每个都是代码里 import 进来的
+        // 具体实现（read/write/edit/shell/task/...），跟上面 custom（用户/插件工具）是两条不同来源。
+        // 5. 初始化内置工具
         const tool = yield* Effect.all({
           invalid: Tool.init(invalid),
           shell: Tool.init(shell),
@@ -220,6 +246,10 @@ const layer = Layer.effect(
           plan: Tool.init(plan),
         })
 
+        // builtin 数组：注意 question/lsp/plan 是用 `...(flag ? [x] : [])` 这种写法
+        // 按 flags 条件性塞进去的——同样是"功能开关"模式，实验性工具先只在部分
+        // 客户端/配置下暴露给模型，验证稳定了再放开给所有人。
+        // 6. 返回全量工具注册表
         return {
           custom,
           builtin: [
@@ -245,7 +275,11 @@ const layer = Layer.effect(
         }
       }),
     )
+    // 【八.一 到此结束】小结：state 就是"全量工具表"，builtin + custom 两条来源，
+    // 每个工作目录懒加载一次、缓存住（InstanceState）。看到这就够了。
 
+    // 下面 all/ids 只是读 state 的简单 getter，describeTask 是给 task 工具生成
+    // "有哪些 subagent 可调"的说明文字，都是次要细节，可以直接跳到八.二。
     const all: Interface["all"] = Effect.fn("ToolRegistry.all")(function* () {
       const s = yield* InstanceState.get(state)
       return [...s.builtin, ...s.custom] as Tool.Def[]
@@ -276,6 +310,8 @@ const layer = Layer.effect(
     // 这就是 tools.ts 七.二里调的 registry.tools(...)。
     // 下一步：回到【学习顺序：九】(session/prompt.ts 里 handle.process() 调用处)
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      // 【工程点】这里没有维护一张"模型能力表"，而是直接按 modelID 字符串特征
+      // （比如包含 "gpt-"）临时判断——简单粗暴但好维护，新模型不用改结构只加个条件。
       const filtered = (yield* all()).filter((tool) => {
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
@@ -289,6 +325,8 @@ const layer = Layer.effect(
         return true
       })
 
+      // concurrency: "unbounded" ——纯 CPU/内存操作居多（就一次 plugin.trigger 可能是 async），
+      // 没有需要限流的外部资源，所以不设并发上限，能并行就都并行跑。
       return yield* Effect.forEach(
         filtered,
         Effect.fnUntraced(function* (tool: Tool.Def) {
@@ -297,6 +335,10 @@ const layer = Layer.effect(
             parameters: tool.parameters,
             jsonSchema: tool.jsonSchema,
           }
+          // 【新 hook 补充】tool.definition：跟之前讲过的 tool.execute.before/after
+          // 是同一套钩子机制，但触发时机更早——在"要不要把这个工具给这轮 LLM"
+          // 之前，插件还能顺手改一次它的 description/schema（等于是运行期动态改
+          // 工具说明书，而不是改工具的执行逻辑）。
           yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
           const jsonSchema =
             output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
@@ -316,7 +358,13 @@ const layer = Layer.effect(
         { concurrency: "unbounded" },
       )
     })
+    // 【八.二 到此结束】小结：filter（按 model 二选一/开关）+ tool.definition 钩子
+    // + 拼 task 工具的动态说明文字，就是每轮真正塞给 LLM 的工具集怎么来的。
+    // 主线到这里结束，可以直接回【学习顺序：九】(session/prompt.ts)。
 
+    // 下面 named()/Service.of(...)/node 都是标准的 DI 收尾（跟其它 Service 文件同一套写法），
+    // 329 行往后（isZodType...normalizeZodJsonSchema）是 Zod→JSON Schema 的兼容层细节，
+    // 只在给插件工具的参数 schema 排查问题时才需要看，主线可以直接跳过、不用往下翻了。
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
       const s = yield* InstanceState.get(state)
       return { task: s.task, read: s.read }

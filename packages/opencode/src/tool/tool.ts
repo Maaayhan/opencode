@@ -96,6 +96,11 @@ export type InferDef<T> =
       ? Def<P, M>
       : never
 
+// 【架构分层 · 第②层：OpenCode Tool 抽象层】wrap() 是所有工具共用的一层壳，
+// 跟具体某个工具（glob/read/bash...）无关：统一做参数校验/解码（Schema）、
+// 校验失败转成 InvalidArgumentsError、执行完统一跑一遍 truncate.output。
+// 每个具体工具（第③层）只需要提供 { description, parameters, execute }，
+// 这些"通用麻烦事"在这里一次性做掉，不用每个工具自己重复写。
 function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadata>(
   id: string,
   init: Init<Parameters, Result>,

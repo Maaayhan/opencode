@@ -46,6 +46,12 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         void ctx
+        // 【追踪结论：pending 是纯内存 Map，不落库、不跨进程可恢复】
+        // 权限请求（doom_loop、文件写入确认等）只存在于这个进程当次运行的
+        // InstanceState 里，没有对应的数据库表或事件溯源记录。下面这个
+        // finalizer 就是证据：一旦这个 Service/Layer 的 scope 结束（进程退出
+        // 或服务重启），所有还没被回复的请求会被自动 Deferred.fail 成
+        // RejectedError——也就是自动拒绝，而不是留到下次进程启动后继续等。
         const state = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
@@ -64,6 +70,13 @@ const layer = Layer.effect(
       }),
     )
 
+    // 【追踪结论：ask() 挡的是"要不要继续往下跑这段代码"，不是"工具能不能跑"】
+    // 调用方（比如 processor.ts 的 doom_loop 检测）yield* 这个函数时，如果命中
+    // needsAsk，会在下面 Deferred.await(deferred) 真正挂起当前 Effect fiber，
+    // 直到 reply() 被调用。但这个 Deferred 只存在于 OpenCode 自己的调用链里——
+    // 如果调用方是在 AI SDK 已经把工具丢出去执行之后才调 ask()（doom_loop 正是
+    // 这种情况，AI SDK 的 executeToolCall 不等任何消费者），那么工具本身的
+    // 执行早已跟这个 Deferred 脱钩、独立跑着，ask() 挂起/恢复对它没有任何影响。
     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
@@ -139,6 +152,14 @@ const layer = Layer.effect(
         return
       }
 
+      // 【追踪结论：Allow once 和 Always allow 共用同一行 Deferred.succeed】
+      // 区别只在这行之后：once 直接 return，不碰 approved；always 才会往
+      // approved（进程内存数组，同样不落库）里追加规则，并且顺便把其它
+      // 命中新规则的 pending 请求也一并唤醒（下面 166-179 行）。
+      // 唤醒这个 Deferred 之后，真正发生的事情是：调用方那边 yield*
+      // permission.ask(...) 挂起的那一行恢复执行——不是重新调用工具，
+      // 工具本身是否已经执行完全不受这次唤醒影响（doom_loop 场景下几乎
+      // 总是已经执行完了，见 processor.ts 里 doom_loop 那段补充注释）。
       yield* Deferred.succeed(existing.deferred, undefined)
       if (input.reply === "once") return
 

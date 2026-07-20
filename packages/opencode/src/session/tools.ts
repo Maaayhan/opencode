@@ -125,6 +125,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       // "把一段 Effect 当 Promise 跑起来"的桥接方法——这是整个工程里
       // Effect 生态和外部 JS 生态（这里是 AI SDK）打交道的典型模式。
       // 下一步：工具从哪来 —— 看【学习顺序：八】(packages/opencode/src/tool/registry.ts)
+      //
+      // 【补充】这个 execute 不是被 OpenCode 自己的代码调用的，而是被 AI SDK
+      // 内部的 executeToolCall()（node_modules/ai dist/index.js，`tool2.execute
+      // .bind(tool2)`）在 streamText() 收到模型的 tool-call 后同步调用的——
+      // 也就是说，从"模型吐出 tool-call"到"这个函数被执行"，中间没有经过
+      // OpenCode 的 runLoop/processor，是 AI SDK 一条内部路径直接触发的。
+      // 调用时机是同一次 streamText() 内部的当前 step，不是下一次模型调用。
       execute(args, options) {
         return run.promise(
           Effect.gen(function* () {

@@ -634,6 +634,18 @@ const layer: Layer.Layer<
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
+    // 【追踪结论：updatePart 本身不写数据库，只发一个 durable 事件】
+    // 这里看起来只是 events.publish，真正的 SQL 写入（db.insert(PartTable)
+    // .onConflictDoUpdate(...)）发生在 packages/core/src/session/projector.ts:
+    // 312-330 —— 那是订阅 SessionV1.Event.PartUpdated 的一个 projector，
+    // 跟这次 publish 一起跑在同一个 db.transaction 里（packages/core/src/
+    // event.ts:240 commitDurableEvent()）。之所以能这样，是因为 PartUpdated
+    // 这个事件定义带了 durable 标记（schema/v1/session.ts:618-626 的
+    // ...options 展开了 durable:{aggregate:"sessionID",version:1}）——
+    // 这是一套事件溯源(event sourcing)架构：先写事件日志(EventTable)，
+    // projector 在同一事务里把事件"物化"进业务表(PartTable)。
+    // 对比下面的 updatePartDelta：那个事件定义没有 durable 标记，
+    // 完全走内存 PubSub，不会触发这整套事务/projector 逻辑。
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
         yield* events.publish(SessionV1.Event.PartUpdated, {
@@ -876,6 +888,17 @@ const layer: Layer.Layer<
       return input.partID
     })
 
+    // 【追踪结论：这是全链路里唯一"只广播、完全不落库"的写入方法】
+    // MessageV2.Event.PartDelta 的定义（schema/v1/session.ts:638-647）没有
+    // spread 那个 durable options，跟上面 updatePart 用的 PartUpdated 正好
+    // 相反。events.publish 内部（core/src/event.ts:369-396 publishEvent）
+    // 一看 definition.durable 是假的，直接跳过 commitDurableEvent/db.transaction，
+    // 只做一次纯内存 PubSub.publish（event.ts:406-417 notify）。
+    // 后果：这一个 delta 字符串只存在于"当次广播"这一瞬间，SQLite 里没有
+    // 任何记录；前端收到后是自己在内存 store 里拿 += 累加出全文的
+    // （packages/app/src/context/global-sync/event-reducer.ts:298-322）。
+    // 真正把累积出来的全文落库，要靠调用方后续再调一次 updatePart（全量），
+    // 例如 processor.ts 的 text-end case。
     const updatePartDelta = Effect.fnUntraced(function* (input: {
       sessionID: SessionID
       messageID: MessageID

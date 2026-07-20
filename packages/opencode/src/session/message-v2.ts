@@ -403,6 +403,15 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 
   const tools = Object.fromEntries(Array.from(toolNames).map((toolName) => [toolName, { toModelOutput }]))
 
+  // 【补充：工具结果重新进入模型上下文的具体落点】上面 for 循环已经把
+  // DB 里状态为 completed 的 tool part（上一轮工具执行结果）转成了
+  // `tool-${name}` 类型、state: "output-available" 的 UIMessage part
+  // （见上面 part.type === "tool" 分支）。这里调 AI SDK 官方的
+  // convertToModelMessages() 把它们连同 toolCallId/input/output 一起
+  // 编译成 ModelMessage[] 里配对的 tool-call + tool-result content block
+  // ——这就是 prompt.ts runLoop 每轮重新调用本函数后，能让模型"看到"
+  // 上一轮工具结果的地方。调用方见 prompt.ts 的
+  // `MessageV2.toModelMessagesEffect(msgs, model)`。
   return yield* Effect.promise(() =>
     convertToModelMessages(
       result.filter((msg) => msg.parts.some((part) => part.type !== "step-start")),

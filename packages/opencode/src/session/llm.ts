@@ -51,13 +51,18 @@ export type StreamRequest = StreamInput & {
   abort: AbortSignal
 }
 
-// 【学习顺序：十一】十一.一 —— Provider 抽象层
+// 【学习顺序：十一】十一.一 —— Provider 抽象层（精读，54~65 行，到下面 `class Service` 那行结束）
 // processor.ts（十）只认识一种东西：Stream<LLMEvent>（provider 无关的统一事件流）。
 // 这个模块负责把"任意 provider 的具体请求方式"适配成这一种流，屏蔽掉
 // OpenAI/Anthropic/Gemini 等各家 API 形态的差异。内部实际有两条实现路径
 // (见下面 stream 的实现，十一.二)：默认走 Vercel AI SDK 的 streamText；
 // 灰度开关 experimentalNativeLlm 打开时走自研的 @opencode-ai/llm 原生实现。
 // 两条路径最终都被拍平成同一种 LLMEvent 流，processor.ts 完全不关心走的是哪条。
+//
+// 读完这 12 行就可以直接跳到本文件 364 行的十一.二（对外入口 stream 函数）。
+// 中间 67~362 行（下面 `live` 这个 Layer 的实现，核心是 run() 函数）是选读：
+// 装的是 GitLab Workflow 特判、native/ai-sdk 路径切换、streamText 参数拼装
+// 这些"某个 provider 具体怎么适配"的细节，不影响理解主链路。
 export interface Interface {
   readonly stream: (input: StreamInput) => Stream.Stream<LLMEvent, unknown>
 }
@@ -89,6 +94,11 @@ const live: Layer.Layer<
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
 
+    // ────────── 92~362 行是 run() 的实现：选读，想跳过直接看第 364 行的十一.二 ──────────
+    // 只有两条路径最终产出 LLMEvent 流：native runtime（233 行起，灰度开关
+    // experimentalNativeLlm）和默认的 AI SDK streamText（278 行起，最终 return 的那个）。
+    // 中间 122~213 行是 GitLab Workflow 模型的特判逻辑（工具执行桥接 + 审批流程），
+    // 只有 language 是 GitLabWorkflowLanguageModel 时才会触发，可以先跳过不看。
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
@@ -231,6 +241,7 @@ const live: Layer.Layer<
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
+        // ← 调用大模型（灰度路径）：走自研 @opencode-ai/llm，绕开 AI SDK 直接发请求
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -284,6 +295,19 @@ const live: Layer.Layer<
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
         type: "ai-sdk" as const,
+        // ← 调用大模型（默认路径）：Vercel AI SDK 的 streamText，真正发 HTTP 请求给
+        // provider 的地方就是这一行；下面一大坨都是传给它的参数（工具、消息、温度等）
+        //
+        // 【补充：关键——这里没有传 stopWhen / prepareStep】AI SDK 的默认值是
+        // stopWhen = stepCountIs(1)（ai/dist/index.js:6459，即 streamText 解构
+        // 参数默认值），意味着这一次 streamText() 调用内部最多只跑 1 个 step：
+        // 如果模型这一步请求了工具，AI SDK 会在这次调用内部自动执行
+        // tool.execute()（tools.ts 里注册的那个），但执行完因为 stepCountIs(1)
+        // 已经满足停止条件，不会自动把工具结果塞回去再发第二次模型请求，
+        // 而是直接 finish 这个 stream。"工具结果喂回模型" 这件事是 OpenCode
+        // 在应用层自己实现的（prompt.ts 的 runLoop while(true) + hasToolCalls
+        // 判断），跟 AI SDK 自带的多 step 循环能力（stopWhen 调大就能用）无关，
+        // 当前代码根本没启用后者。
         result: streamText({
           onError(error) {
             bridge.fork(
@@ -361,10 +385,14 @@ const live: Layer.Layer<
       }
     })
 
-    // 十一.二 —— 对外唯一入口：processor.ts 十.二里的 `llm.stream(streamInput)` 调的就是这个。
+    // 十一.二 —— 对外唯一入口（精读，364~392 行，到下面 `)` 收尾那行结束）：
+    // processor.ts 十.二里的 `llm.stream(streamInput)` 调的就是这个。
     // Stream.scoped + AbortController：session 中断/超时时通过 scope 释放
     // 自动触发 abort，不需要在每个调用点手动管生命周期。
     // 拿到这个事件流后，回到【学习顺序：十二】(processor.ts 的 handleEvent) 继续看怎么消费
+    //
+    // 到这里十一就读完了。394~416 行是 Service/Layer/node 的装配样板代码，
+    // 跟其他模块长得几乎一样（对照 registry.ts 八就认得），不用细看。
     const stream: Interface["stream"] = (input) =>
       Stream.scoped(
         Stream.unwrap(

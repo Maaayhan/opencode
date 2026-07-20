@@ -295,6 +295,14 @@ export function applyDirectoryEvent(input: {
       }
       break
     }
+    // 【追踪结论：这里的 += 就是"为什么不会只看到最后一个 delta"的全部原因】
+    // 这个事件（message.part.delta，后端见 session.ts 的 updatePartDelta）
+    // 从后端到这里全程没有落库，是纯 SSE 广播；后端也没有 sequence
+    // number/幂等机制。前端能拼出完整文本，纯粹靠下面 318 行的
+    // (existing ?? "") + props.delta —— 字符串拼接而不是赋值覆盖。
+    // 断线重连时这个内存 store 会被清空重建，届时是重新拉一次 REST
+    // （session.messages），读到的是后端数据库里最后一次全量 updatePart
+    // 写入的内容，不会重放这里累积过的 delta。
     case "message.part.delta": {
       const props = event.properties as { messageID: string; partID: string; field: string; delta: string }
       const parts = input.store.part[props.messageID]

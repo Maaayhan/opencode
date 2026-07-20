@@ -315,6 +315,19 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        // 【追踪结论：track() 拍的是一个"影子 git 仓库"里的 tree hash，不是 commit】
+        // --git-dir 指向 state.gitdir（上面 71 行：Global.Path.data/snapshot/
+        // <projectID>/<worktree的hash>）——完全独立于项目自己的 .git，
+        // --work-tree 才是真实项目目录。核心三步都在下面：
+        //   1) add()：把"已跟踪但被改的文件"+"未跟踪的新文件"（排除 .gitignore
+        //      命中、排除 >2MB 的未跟踪大文件）git add 进这个影子仓库的暂存区；
+        //   2) git write-tree：把暂存区状态写成一个 tree 对象，返回它的 hash；
+        //      —— 注意这只是 tree，不是 commit（没有 parent、没有 commit message）；
+        //   3) 文件内容确实被完整存进了这个影子仓库的 git 对象库（blob），
+        //      不是只记文件名/mtime，seed() 还会共享真实 .git 的对象库做加速。
+        // 非 Git 项目/配置关闭快照时，enabled() 为假，这里直接 return undefined，
+        // 调用方（processor.ts）里 ctx.snapshot 会一直是 falsy，整个快照/patch
+        // 链路自动跳过。
         const track = Effect.fnUntraced(function* () {
           return yield* locked(
             Effect.gen(function* () {
@@ -346,6 +359,13 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        // 【追踪结论：patch.hash 就是传进来的这个基线 hash 本身，不是 diff 的 hash】
+        // 逻辑：先 add() 把当前工作区最新状态重新暂存一遍，再用
+        // `git diff --cached --name-only <基线hash>` 对比"暂存区 vs 基线 tree"，
+        // 只拿到"哪些路径变了"的列表——注意只用了 --name-only，没有
+        // --name-status，所以 patch.files 本身不区分新增/修改/删除，
+        // 需要的话要另外调 diffFull()。返回值里的 hash 原样透传，
+        // 是调用方后续做 restore()/revert() 时用来定位这棵基线 tree 的钥匙。
         const patch = Effect.fnUntraced(function* (hash: string) {
           return yield* locked(
             Effect.gen(function* () {
@@ -379,6 +399,11 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
           )
         })
 
+        // 【追踪结论：snapshot 不只是用来展示 diff，restore()/revert() 能真正回滚】
+        // git read-tree <hash> 把索引换成基线 tree 的内容，
+        // git checkout-index -a -f 强制把工作区文件也覆盖成索引里的内容——
+        // 这是真实的文件回滚操作，不是只读展示。revert()（下面）还支持
+        // 按文件粒度回滚到某个具体 patch 的基线。
         const restore = Effect.fnUntraced(function* (snapshot: string) {
           return yield* locked(
             Effect.gen(function* () {

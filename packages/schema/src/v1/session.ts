@@ -615,6 +615,12 @@ const events = {
       messageID: MessageID,
     },
   }),
+  // 【追踪结论】...options 展开了 durable:{aggregate:"sessionID",version:1}——
+  // 这一个标记决定了 events.publish 会不会真正落库（走 db.transaction +
+  // projector，见 packages/core/src/event.ts 的 commitDurableEvent 和
+  // packages/core/src/session/projector.ts:312-330 对 PartUpdated 的处理）。
+  // 对照最下面的 PartDelta：那个 define() 没有 spread ...options，
+  // 所以是非 durable 事件，只走内存 PubSub，永远不会出现在 SQLite 里。
   PartUpdated: define({
     type: "message.part.updated",
     ...options,
@@ -635,6 +641,11 @@ const events = {
   }),
 }
 
+// 【追踪结论：故意不带 durable 标记】跟上面 PartUpdated 对比着看——这里没有
+// spread ...options，所以 events.publish(PartDelta, ...) 不会走
+// commitDurableEvent/db.transaction，纯粹是内存 PubSub 广播（给 SSE 用）。
+// 数据库里不会有任何一条 PartDelta 的记录，session/session.ts 的
+// updatePartDelta() 就是唯一的发布点。
 export const PartDelta = define({
   type: "message.part.delta",
   schema: {

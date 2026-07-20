@@ -1101,6 +1101,18 @@ const layer = Layer.effect(
     // 关键设计：循环状态不放在内存变量里，而是每轮都从数据库重新读消息列表
     // (MessageV2.filterCompactedEffect)。这样进程重启/中断后可以从数据库恢复，
     // 不需要额外的持久化状态机。
+    //
+    // 【补充：模型调用 ↔ 工具调用调度循环，核心结论】
+    // "工具执行完，再调一次模型"这个决定就是在这个 while(true) 里做的，
+    // 不是 AI SDK 的 streamText() 内部自动继续的。原因：llm.ts 调 streamText()
+    // 时没传 stopWhen，AI SDK 默认 stopWhen = stepCountIs(1)（见 ai/dist/index.js:6459），
+    // 也就是每次 streamText() 最多只跑 1 个 step——工具会在这一个 step 内被
+    // AI SDK 自动执行，但执行完不会自动把结果喂回去再问模型，而是直接
+    // finish 这个 stream。真正"拿着工具结果再问一次模型"，靠的是本循环
+    // 下一轮重新读 DB（此时上一轮的 tool-result 已经落库）、重新拼 messages、
+    // 重新发起一次全新的 process()/streamText()。详见下面 hasToolCalls
+    // 判断处和 toModelMessagesEffect 调用处的补充注释；完整链路见
+    // LEARNING-PIPELINE.md「专题：模型调用 ↔ 工具调用的调度循环」。
     // ============================================================
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
@@ -1155,6 +1167,12 @@ const layer = Layer.effect(
             lastAssistantMsg?.parts.some(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
+
+          // 【补充】这行 hasToolCalls，就是"要不要再调一次模型"的真正判定点。
+          // 上一轮 streamText() 因为 stopWhen 默认 stepCountIs(1) 只跑了 1 个
+          // step，跑完工具就直接结束了，不会自己再问模型。所以这里必须由
+          // OpenCode 自己检查"上一条 assistant 消息里是不是还挂着没消化的
+          // tool part"——如果有，就不能 break，得进下一轮循环重新问模型。
 
           // 四.二 —— 循环退出条件
           // 同时满足：有明确的非 tool-calls 结束原因 && 确实没有待处理的工具调用
@@ -1358,7 +1376,13 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model), // 把内部消息格式转成 provider 需要的消息格式
+              // 把内部消息格式转成 provider 需要的消息格式。
+              // 【补充】这一步就是"工具结果被塞回下一次模型请求"的具体发生地：
+              // msgs 里已经带着上一轮落库的 tool-result（第 2 步 filterCompactedEffect
+              // 现读出来的），toModelMessagesEffect 内部把它转成 tool-* UIMessage part，
+              // 再调 AI SDK 官方的 convertToModelMessages() 转成 ModelMessage[]
+              // （实现见 message-v2.ts 的 toModelMessagesEffect，尾部那次 convertToModelMessages 调用）。
+              MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [
               ...env,
@@ -1377,6 +1401,14 @@ const layer = Layer.effect(
             // 工具调用也在这内部被执行、结果被塞回。这里只关心它的返回结果
             // (stop / compact / 其它)，具体怎么消费 stream 是 processor.ts 的事
             // ——去看【学习顺序：十】(packages/opencode/src/session/processor.ts)
+            //
+            // 【补充：这一次 handle.process() = 一次 streamText() = 最多一次模型
+            // API 调用】llm.ts 调 streamText() 时没传 stopWhen，AI SDK 默认
+            // stopWhen=stepCountIs(1)，所以哪怕这一步模型请求了工具、AI SDK
+            // 也只会在这一次调用内部自动把工具跑完，不会自己再发第二次模型
+            // 请求。工具结果需要"喂回模型"的话，靠的是外层 runLoop 检测到
+            // hasToolCalls 为真后，回到 while(true) 顶部重新走一遍本函数、
+            // 重新发起一次新的 handle.process()——即下一轮的这一行。
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1480,6 +1512,7 @@ const layer = Layer.effect(
     // 如果已经有一个在跑（比如用户又发了一条消息），ensureRunning 会复用
     // 现有的那个 Effect fiber 而不是重新起一个，避免同一会话被并发写坏。
     // 下一步：模型说完、工具都跑完之后，结果怎么被用户看到？
+    // 保证同一个 Session 在同一时刻只有一条 Agent 主流程（runLoop）在运行，避免并发把会话状态写乱
     // 去看【学习顺序：十五】(packages/opencode/src/server/routes/instance/httpapi/handlers/event.ts)
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,

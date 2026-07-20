@@ -309,6 +309,13 @@ const layer = Layer.effectDiscard(
           .pipe(Effect.orDie)
       }),
     )
+    // 【追踪结论：这就是 session.updatePart() 真正写 SQLite 的地方】
+    // opencode/src/session/session.ts 的 updatePart() 只 events.publish 了
+    // 一个 PartUpdated 事件；因为该事件定义带 durable 标记（schema/v1/
+    // session.ts 的 ...options），event.ts 的 commitDurableEvent() 会在一个
+    // db.transaction 里跑完所有注册的 projector 再提交——下面这个 project()
+    // 回调就是那个 projector：INSERT ... ON CONFLICT DO UPDATE 进 PartTable，
+    // 跟事件日志本身（EventTable）的写入在同一个事务里，要么都成功要么都回滚。
     yield* events.project(SessionV1.Event.PartUpdated, (event) =>
       Effect.gen(function* () {
         const id = event.data.part.id
